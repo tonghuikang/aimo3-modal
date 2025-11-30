@@ -7,7 +7,7 @@ Please read the [Kaggle discussions](https://www.kaggle.com/competitions/ai-math
 
 # Setup
 
-Run `uv sync` to install packages in .venv
+Run `uv sync` to install packages in `.venv`
 
 
 # Deploy inference
@@ -23,7 +23,7 @@ https://<handle>--example-gpt-oss-inference-serve.modal.run/v1/models
 ```
 
 
-You will need to save the url to `env.json`. It looks something like
+You will need to save the url to `env.json`. It should look something like
 
 ```
 {
@@ -38,7 +38,7 @@ You will need to save the url to `env.json`. It looks something like
 uv run python3 kaggle.py
 ```
 
-You should see problems being solve.
+You should see problems being solved.
 
 The same code could be used on Kaggle.
 
@@ -46,12 +46,13 @@ How to upload to Kaggle
 - File > Editor Type > Script
 - Paste `kaggle.py` over
 - File > Editor Type > Notebook
+- (follow the following instructions depending which GPU do you want to use)
 
-To run with H100 GPU (which you make make a submission with)
+To run with Kaggle H100 GPU (which you make make a submission with)
 - Session options > Accelerator > GPU H100
 - Internet off
 
-To run without H100 GPU
+To run with external H100 GPU
 - Add-ons > Secrets > Add Secret > Label: REMOTE_VLLM_URL, Value: (copy the URL over)
 - Session options > Accelerator > None
 - Internet on
