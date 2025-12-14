@@ -7,11 +7,11 @@
 # uv run python3 kaggle.py
 # ```
 
-# %% [markdown]
+# %% [markdown] {"jupyter":{"outputs_hidden":false}}
 # # Configuration
 
 # %% [code] {"jupyter":{"outputs_hidden":false}}
-serve_vllm_on_kaggle = False
+serve_vllm_on_kaggle = True
 run_all_questions = False   # ignored for submissions
 
 # %% [code] {"jupyter":{"outputs_hidden":false}}
@@ -57,7 +57,7 @@ print(f"{serve_vllm_on_kaggle=}")
 print(f"{run_all_questions=}")
 print(f"{REMOTE_VLLM_URL[::-1][:13][::-1]=}")
 
-# %% [markdown]
+# %% [markdown] {"jupyter":{"outputs_hidden":false}}
 # # Setup
 
 # %% [code] {"_kg_hide-output":true,"jupyter":{"outputs_hidden":false}}
@@ -206,6 +206,143 @@ if is_on_kaggle_interactive():
     # because inference server needs to start within 15 minutes
     await_client()
 
+# %% [markdown] {"jupyter":{"outputs_hidden":false}}
+# # Code execution
+
+# %% [code] {"jupyter":{"outputs_hidden":false}}
+class LocalJupyterSession:
+    """Stateful helper that proxies execution through a local Jupyter kernel.
+    Extracted from gpt_oss.tools.python_docker.docker_tool.
+    Thread-safe: creates its own ZMQ context for use within a single thread.
+    """
+
+    def __init__(self, timeout: float = 10.0) -> None:
+        import zmq
+        from jupyter_client import BlockingKernelClient, KernelManager
+
+        self._default_timeout = timeout
+        # Create a dedicated ZMQ context for this session (thread-safe)
+        self._zmq_context = zmq.Context()
+        self._km = KernelManager(context=self._zmq_context)
+        self._km.start_kernel()
+        self._client: BlockingKernelClient = self._km.blocking_client()
+        self._client.start_channels()
+        self._client.wait_for_ready(timeout=self._default_timeout)
+
+    def execute(self, code: str, timeout: float | None = None) -> str:
+        """Execute code in the kernel, returning combined stdout/stderr output."""
+        client = self._client
+        effective_timeout = timeout or self._default_timeout
+        msg_id = client.execute(
+            code,
+            store_history=True,
+            allow_stdin=False,
+            stop_on_error=False,
+        )
+
+        stdout_parts: list[str] = []
+        stderr_parts: list[str] = []
+
+        while True:
+            try:
+                msg = client.get_iopub_msg(timeout=effective_timeout)
+            except queue.Empty as exc:
+                raise TimeoutError(
+                    "Timed out waiting for Jupyter kernel output."
+                ) from exc
+
+            if msg.get("parent_header", {}).get("msg_id") != msg_id:
+                continue
+
+            msg_type = msg.get("msg_type")
+            content = msg.get("content", {})
+
+            if msg_type == "stream":
+                text = content.get("text", "")
+                if content.get("name") == "stdout":
+                    stdout_parts.append(text)
+                else:
+                    stderr_parts.append(text)
+            elif msg_type == "error":
+                traceback_data = content.get("traceback")
+                if traceback_data:
+                    stderr_parts.append("\n".join(traceback_data))
+                else:
+                    ename = content.get("ename", "")
+                    evalue = content.get("evalue", "")
+                    stderr_parts.append(f"{ename}: {evalue}".strip())
+            elif msg_type in {"execute_result", "display_data"}:
+                data = content.get("data", {})
+                text = data.get("text/plain")
+                if text:
+                    stdout_parts.append(text if text.endswith("\n") else f"{text}\n")
+            elif msg_type == "status" and content.get("execution_state") == "idle":
+                break
+
+        # Drain the shell channel to capture final execution status
+        while True:
+            try:
+                reply = client.get_shell_msg(timeout=effective_timeout)
+            except queue.Empty as exc:
+                raise TimeoutError(
+                    "Timed out waiting for Jupyter kernel execution reply."
+                ) from exc
+
+            if reply.get("parent_header", {}).get("msg_id") == msg_id:
+                break
+
+        stdout = "".join(stdout_parts)
+        stderr = "".join(stderr_parts)
+
+        if stderr:
+            if stdout:
+                stdout = f"{stdout.rstrip()}\n{stderr}"
+            else:
+                stdout = stderr
+
+        if not stdout.strip():
+            stdout = (
+                "[WARN] No output available. Use print() to output anything to stdout to "
+                "receive the output"
+            )
+
+        return stdout
+
+    def close(self) -> None:
+        import contextlib
+
+        # Stop client channels first (closes ZMQ sockets)
+        with contextlib.suppress(Exception):
+            self._client.stop_channels()
+
+        # Shutdown kernel process
+        with contextlib.suppress(Exception):
+            self._km.shutdown_kernel(now=True)
+
+        # Cleanup kernel manager resources
+        with contextlib.suppress(Exception):
+            self._km.cleanup_resources()
+
+        # Destroy ZMQ context - use destroy() instead of term() for immediate cleanup
+        with contextlib.suppress(Exception):
+            self._zmq_context.destroy(linger=0)
+
+    def __del__(self) -> None:
+        # Guard against Python shutdown (when sys.meta_path is None)
+        import sys
+
+        if sys.meta_path is not None:
+            self.close()
+
+
+def execute_python_code(
+    session: LocalJupyterSession, script: str, timeout: float = 10.0
+) -> str:
+    """Execute Python code in a stateful Jupyter session."""
+    try:
+        return session.execute(script, timeout=timeout)
+    except TimeoutError as exc:
+        return f"[ERROR] {exc}"
 
 # %% [markdown] {"jupyter":{"outputs_hidden":false}}
 # # Token processing
@@ -248,13 +385,46 @@ from openai_harmony import (
 harmony_encoding = load_harmony_encoding(HarmonyEncodingName.HARMONY_GPT_OSS)
 stop_token_ids: list[int] = list(harmony_encoding.stop_tokens_for_assistant_actions())
 
+# Python tool configuration for gpt-oss (extracted from gpt_oss.tools.python_docker.docker_tool)
+# Using dangerously_use_local_jupyter backend - stateful execution via Jupyter kernel
+from openai_harmony import Author, TextContent, ToolNamespaceConfig
+import queue
+
+# Stateful Python tool instruction (matches how the model was trained)
+PYTHON_TOOL_INSTRUCTION = """
+Use this tool to execute Python code in your chain of thought. The code will not be shown to the user. This tool should be used for internal reasoning, but not for code that is intended to be visible to the user (e.g. when creating plots, tables, or files).
+When you send a message containing Python code to python, it will be executed in a stateful Jupyter notebook environment. python will respond with the output of the execution or time out after 120.0 seconds. Internet access for this session is disabled.
+""".strip()
+
+python_tool_config = ToolNamespaceConfig(
+    name="python", description=PYTHON_TOOL_INSTRUCTION, tools=[]
+)
+
+
+def make_python_tool_response(output: str, channel: str | None = None) -> Message:
+    """Create a tool response message for the Python tool."""
+    content = TextContent(text=output)
+    author = Author(role=Role.TOOL, name="python")
+    message = Message(
+        author=author,
+        content=[content],
+    ).with_recipient("assistant")
+    if channel:
+        message = message.with_channel(channel)
+    return message
+
+
 def build_prompt_token_ids(
     system_content: str,
     user_content: str,
     reasoning_effort: ReasoningEffort,
+    enable_python_tool: bool = False,
 ) -> list[int]:
     """Convert system and user content to token IDs using harmony format."""
     system_content_obj = SystemContent.new().with_reasoning_effort(reasoning_effort)
+    if enable_python_tool:
+        # Enable Python tool using with_tools() for stateless mode
+        system_content_obj = system_content_obj.with_tools(python_tool_config)
     system_message = Message.from_role_and_content(
         Role.SYSTEM,
         system_content_obj,
@@ -290,6 +460,22 @@ def append_user_turn_token_ids(
     # Combine: previous prompt + response + user turn tokens
     return all_tokens + user_tokens
 
+
+import time
+
+
+def append_tool_response_token_ids(
+    prompt_ids: list[int], response_ids: list[int], tool_response: Message
+) -> list[int]:
+    """Append response token IDs and a tool response to the prompt."""
+    all_tokens = prompt_ids + response_ids
+    # Render tool response message to tokens
+    tool_tokens = list(
+        harmony_encoding.render_conversation_for_completion(
+            Conversation.from_messages([tool_response]), Role.ASSISTANT
+        )
+    )
+    return all_tokens + tool_tokens
 
 # %% [code] {"jupyter":{"outputs_hidden":false},"execution":{"iopub.status.busy":"2025-11-25T11:23:07.544491Z","iopub.execute_input":"2025-11-25T11:23:07.544919Z","iopub.status.idle":"2025-11-25T11:23:07.550311Z","shell.execute_reply.started":"2025-11-25T11:23:07.5449Z","shell.execute_reply":"2025-11-25T11:23:07.549876Z"}}
 from cachetools import cached, TTLCache
@@ -426,19 +612,25 @@ def generate_solution(
     if time.time() >= cutoff_times[-1]:
         return ""
 
+    # Create a dedicated Jupyter session for this solution attempt
+    # Each generate_solution call gets its own isolated session
+    jupyter_session: LocalJupyterSession | None = None
+
     try:
-        # Build initial prompt as token IDs
+        # Build initial prompt as token IDs with Python tool enabled
         prompt_ids: list[int] = build_prompt_token_ids(
             system_content="You will solve the problem and return the final answer in \\boxed{}. The answer is expected to be an integer between 0 and 99999, inclusive. Do not guess the answer, unless specifically given permission to.",
             user_content=question_text,
             reasoning_effort=ReasoningEffort.HIGH,
+            enable_python_tool=True,  # Enable Python tool for code execution
         )
 
         all_token_ids: list[int] = prompt_ids.copy()
         generation_idx = 0
+        tool_call_count = 0
 
         for iteration in range(3):  # guess at 90, guess at 30
-            # Inner loop
+            # Inner loop to handle tool calls within each iteration
             while True:
                 response_ids: list[int] = []
                 text_response = ""
@@ -515,6 +707,50 @@ def generate_solution(
                 if breaking:
                     break
 
+                # Check if the last parsed message is a tool call
+                # After streaming, parser.messages contains the parsed Message objects
+                parsed_messages = stream_parser.messages
+                if parsed_messages:
+                    last_message = parsed_messages[-1]
+                    if (
+                        last_message.recipient is not None
+                        and last_message.recipient.startswith("python")
+                    ):
+                        tool_call_count += 1
+                        # Extract Python code from the message content
+                        python_code = ""
+                        if last_message.content:
+                            first_block = last_message.content[0]
+                            if isinstance(first_block, TextContent):
+                                python_code = first_block.text
+                        if python_code:
+                            print(
+                                f"solution {solution_index:01d} iteration {iteration:01d} tool {tool_call_count:02d} token {len(all_token_ids):05d}"
+                            )
+                            # Lazily create the Jupyter session on first tool call
+                            if jupyter_session is None:
+                                jupyter_session = LocalJupyterSession(timeout=10.0)
+                            # Execute the code using stateful Jupyter session
+                            output = execute_python_code(
+                                jupyter_session, python_code, timeout=10
+                            )
+                            # Create tool response message
+                            tool_response = make_python_tool_response(
+                                output, channel=last_message.channel
+                            )
+                            # Append tool response to prompt
+                            new_prompt_ids = append_tool_response_token_ids(
+                                prompt_ids, response_ids, tool_response
+                            )
+                            # Track the new tokens added (tool response portion)
+                            added_tokens = new_prompt_ids[
+                                len(prompt_ids) + len(response_ids) :
+                            ]
+                            all_token_ids.extend(added_tokens)
+                            prompt_ids = new_prompt_ids
+                            # Continue the inner loop to get next generation
+                            continue
+
                 # Exit inner loop
                 break
 
@@ -524,7 +760,7 @@ def generate_solution(
             boxed_text = extract_boxed_text(text_response)
             user_follow_up = None
             print(
-                f"solution {solution_index:02d}, iteration {iteration:02d} token {len(all_token_ids):05d}"
+                f"solution {solution_index:01d} iteration {iteration:01d} tool {tool_call_count:02d} token {len(all_token_ids):05d}"
             )
             if not is_valid_answer_string(extract_boxed_text(text_response)):
                 if iteration == 0 and cutoff_times[-1] - time.time() < 90:
@@ -562,17 +798,17 @@ def generate_solution(
         boxed_text = extract_boxed_text(detokenized_text)
 
         if question_id and all_token_ids:
-            answer_suffix = ""
+            answer_suffix = "NA"
             if is_valid_answer_string(boxed_text):
-                answer_suffix = f"-{boxed_text}"
+                answer_suffix = f"{boxed_text}"
             total_tokens = len(all_token_ids)
-            base_path = f"solutions/{question_id}/{solution_index:02d}-{total_tokens:05d}{answer_suffix}"
+            base_path = f"solutions/{question_id}/{solution_index:02d}-{total_tokens:05d}-{tool_call_count:03d}-{answer_suffix}"
             # Save full stream as token IDs (one token ID per line)
             with open(f"{base_path}-tokens.txt", "w") as f:
                 for token_id in all_token_ids:
                     f.write(f"{token_id}\n")
             # Save detokenized full stream for readability
-            with open(f"{base_path}.txt", "w") as f:
+            with open(f"{base_path}-text.txt", "w") as f:
                 f.write(detokenized_text)
 
         if is_valid_answer_string(boxed_text):
@@ -582,7 +818,9 @@ def generate_solution(
         return boxed_text
 
     finally:
-        pass
+        # Always clean up the Jupyter session when done
+        if jupyter_session is not None:
+            jupyter_session.close()
 
 # %% [code] {"jupyter":{"outputs_hidden":false},"execution":{"iopub.status.busy":"2025-11-24T08:26:54.553208Z","iopub.execute_input":"2025-11-24T08:26:54.553692Z","iopub.status.idle":"2025-11-24T08:27:03.475341Z","shell.execute_reply.started":"2025-11-24T08:26:54.553671Z","shell.execute_reply":"2025-11-24T08:27:03.474837Z"}}
 if is_on_kaggle_interactive():
@@ -654,18 +892,19 @@ def predict(id_: pl.Series, problem: pl.Series) -> pl.DataFrame | pd.DataFrame:
         if is_on_kaggle_commit():
                 if serve_vllm_on_kaggle:
                     # to conserve Kaggle H100 quota
-                    if "Norwegian" in question_text or "Alice" in question_text:
+                    if not("Norwegian" in question_text or "Alice" in question_text):
                         print("on kaggle commit, skipping question")  # not popping cutoff_times
                         return pl.DataFrame({"id": id_, "answer": 12315})
                 else:
                     # to get quicker feedback
-                    if "Norwegian" in question_text or "Alice" in question_text:
+                    if not("Norwegian" in question_text or "Alice" in question_text):
                         print("on kaggle commit, skipping question")  # not popping cutoff_times
                         return pl.DataFrame({"id": id_, "answer": 12315})
 
+
         if not is_on_kaggle():
             # if you want to debug a particular question locally
-            if "Alice" not in question_text:
+            if not("Alice" not in question_text):
                 print("not on kaggle, skipping question")  # not popping cutoff_times
                 return pl.DataFrame({"id": id_, "answer": 12315})
 
