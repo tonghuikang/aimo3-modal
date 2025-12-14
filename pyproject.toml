@@ -21,6 +21,7 @@ dependencies = [
     "vllm==0.11.2; sys_platform == 'linux'",
     "jupyter-client>=8.6.3",
     "ipykernel>=7.1.0",
+    "fastapi>=0.122.0",
 ]
 
 [dependency-groups]

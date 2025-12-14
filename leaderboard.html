@@ -19,6 +19,7 @@
             text-align: center;
             color: #00d9ff;
             margin-bottom: 20px;
+            font-size: 1.5rem;
         }
         .container {
             max-width: 100%;
@@ -31,6 +32,7 @@
             margin-bottom: 20px;
             border-radius: 8px;
             background: #16213e;
+            font-size: 0.85rem;
         }
         .status.loading {
             color: #fbbf24;
@@ -44,8 +46,9 @@
         .grid-container {
             background: #16213e;
             border-radius: 8px;
-            padding: 20px;
+            padding: 10px;
             overflow-x: auto;
+            -webkit-overflow-scrolling: touch;
         }
         .grid-container h2 {
             color: #00d9ff;
@@ -57,9 +60,21 @@
             justify-content: space-between;
             margin-bottom: 15px;
         }
+        .table-wrapper {
+            overflow-x: auto;
+            -webkit-overflow-scrolling: touch;
+            margin: 0 -10px;
+            padding: 0 10px;
+        }
+:root {
+            --pos-width: 40px;
+            --team-width: 180px;
+            --score-width: 60px;
+        }
         table {
             width: 100%;
-            border-collapse: collapse;
+            border-collapse: separate;
+            border-spacing: 0;
             font-size: 13px;
         }
         th, td {
@@ -67,46 +82,74 @@
             text-align: center;
             border: 1px solid #333;
             white-space: nowrap;
+            box-sizing: border-box;
         }
         th {
             background: #0d1b2a;
             color: #00d9ff;
             font-weight: 600;
-            position: sticky;
-            top: 0;
-            z-index: 10;
         }
         th.team-header {
             text-align: left;
-            min-width: 180px;
+            width: var(--team-width);
+            min-width: var(--team-width);
+            max-width: var(--team-width);
             position: sticky;
-            left: 0;
-            z-index: 20;
+            left: var(--pos-width);
             background: #0d1b2a;
+            transform: translateZ(1px);
         }
         th.pos-header {
-            min-width: 50px;
+            width: var(--pos-width);
+            min-width: var(--pos-width);
+            max-width: var(--pos-width);
             position: sticky;
             left: 0;
-            z-index: 20;
             background: #0d1b2a;
+            transform: translateZ(2px);
         }
         td.pos-cell {
             font-weight: 500;
             color: #888;
+            width: var(--pos-width);
+            min-width: var(--pos-width);
+            max-width: var(--pos-width);
             position: sticky;
             left: 0;
             background: #16213e;
-            z-index: 5;
+            transform: translateZ(2px);
         }
         td.team-cell {
             text-align: left;
             font-weight: 500;
             color: #00d9ff;
+            width: var(--team-width);
+            min-width: var(--team-width);
+            max-width: var(--team-width);
+            overflow: hidden;
+            text-overflow: ellipsis;
             position: sticky;
-            left: 50px;
+            left: var(--pos-width);
             background: #16213e;
-            z-index: 5;
+            transform: translateZ(1px);
+        }
+        th.score-header {
+            width: var(--score-width);
+            min-width: var(--score-width);
+            max-width: var(--score-width);
+            position: sticky;
+            left: calc(var(--pos-width) + var(--team-width));
+            background: #0d1b2a;
+            transform: translateZ(1px);
+        }
+        td.total-score-cell {
+            width: var(--score-width);
+            min-width: var(--score-width);
+            max-width: var(--score-width);
+            position: sticky;
+            left: calc(var(--pos-width) + var(--team-width));
+            background: #16213e;
+            transform: translateZ(1px);
         }
         td.score-cell {
             background: #1a2744;
@@ -137,6 +180,79 @@
         tr:hover td.pos-cell,
         tr:hover td.team-cell {
             background: #1a3a5c;
+        }
+
+        /* Mobile styles */
+        @media (max-width: 600px) {
+            :root {
+                --pos-width: 28px;
+                --team-width: 90px;
+                --score-width: 52px;
+            }
+            body {
+                padding: 10px;
+            }
+            h1 {
+                font-size: 1.2rem;
+                margin-bottom: 10px;
+            }
+            .status {
+                padding: 8px;
+                margin-bottom: 10px;
+                font-size: 0.75rem;
+            }
+            .grid-container {
+                padding: 5px;
+                border-radius: 4px;
+            }
+            table {
+                font-size: 11px;
+            }
+            th, td {
+                padding: 6px 8px;
+            }
+            th.pos-header {
+                width: var(--pos-width);
+                min-width: var(--pos-width);
+                max-width: var(--pos-width);
+            }
+            th.team-header {
+                width: var(--team-width);
+                min-width: var(--team-width);
+                max-width: var(--team-width);
+                left: var(--pos-width);
+            }
+            td.pos-cell {
+                width: var(--pos-width);
+                min-width: var(--pos-width);
+                max-width: var(--pos-width);
+            }
+            td.team-cell {
+                left: var(--pos-width);
+                width: var(--team-width);
+                min-width: var(--team-width);
+                max-width: var(--team-width);
+                overflow: hidden;
+                text-overflow: ellipsis;
+            }
+            th.score-header {
+                width: var(--score-width);
+                min-width: var(--score-width);
+                max-width: var(--score-width);
+                left: calc(var(--pos-width) + var(--team-width));
+            }
+            td.total-score-cell {
+                width: var(--score-width);
+                min-width: var(--score-width);
+                max-width: var(--score-width);
+                left: calc(var(--pos-width) + var(--team-width));
+            }
+            .time-value {
+                font-size: 9px;
+            }
+            .date-header {
+                font-size: 9px;
+            }
         }
     </style>
 </head>
@@ -193,7 +309,7 @@
             html += '<thead><tr>';
             html += '<th class="pos-header">#</th>';
             html += '<th class="team-header">Team</th>';
-            html += '<th>Score</th>';
+            html += '<th class="score-header">Score</th>';
             html += '<th>Subs</th>';
             for (const date of sortedDates) {
                 html += `<th class="date-header">${date}</th>`;
@@ -217,7 +333,7 @@
                 html += '<tr>';
                 html += `<td class="pos-cell">${position}</td>`;
                 html += `<td class="team-cell">${teamName}</td>`;
-                html += `<td class="score-cell has-data"><span class="score-value">${maxScore}</span></td>`;
+                html += `<td class="total-score-cell"><span class="score-value">${maxScore}</span></td>`;
                 html += `<td class="score-cell">${subCount}</td>`;
 
                 // First pass: collect entries for each date
