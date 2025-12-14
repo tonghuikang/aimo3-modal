@@ -175,6 +175,40 @@
             color: #888;
         }
 
+        .tokens-input {
+            flex: 1;
+            resize: none;
+            border: none;
+            outline: none;
+            color: #888;
+            font-family: 'Consolas', 'Monaco', monospace;
+            font-size: 0.85rem;
+        }
+
+        .tokens-input:focus {
+            background-color: #1a2744;
+        }
+
+        #tokens-content {
+            display: none;
+        }
+
+        #tokens-panel.has-tokens #tokens-input {
+            display: none;
+        }
+
+        #tokens-panel.has-tokens #tokens-content {
+            display: block;
+        }
+
+        #tokens-panel.editing #tokens-input {
+            display: block;
+        }
+
+        #tokens-panel.editing #tokens-content {
+            display: none;
+        }
+
         #text-panel .panel-content {
             color: #a8e6cf;
         }
@@ -290,8 +324,8 @@
         <div class="panel" id="tokens-panel">
             <div class="panel-header">
                 Tokens
-                <span id="token-count">0 tokens</span>
             </div>
+            <textarea class="panel-content tokens-input" id="tokens-input" placeholder="Paste token IDs here (one per line)..."></textarea>
             <div class="panel-content" id="tokens-content"></div>
         </div>
         <div class="panel" id="text-panel">
@@ -350,7 +384,6 @@
                 container.appendChild(div);
             });
 
-            document.getElementById('token-count').textContent = `${tokenIds.length} tokens`;
         }
 
         async function decodeTokens() {
@@ -886,10 +919,71 @@
             }
         }
 
+        // Double-click on tokens panel to switch to edit mode
+        function setupTokensPanelDoubleClick() {
+            const tokensContent = document.getElementById('tokens-content');
+            tokensContent.addEventListener('dblclick', () => {
+                const panel = document.getElementById('tokens-panel');
+                panel.classList.add('editing');
+                document.getElementById('tokens-input').focus();
+            });
+        }
+
+        // Process tokens from textarea input
+        async function processTokenInput() {
+            const input = document.getElementById('tokens-input');
+            const text = input.value.trim();
+
+            if (!text) {
+                document.getElementById('status').textContent = 'No tokens to decode';
+                return;
+            }
+
+            tokenIds = text.split('\n')
+                .map(line => parseInt(line.trim()))
+                .filter(n => !isNaN(n));
+
+            if (tokenIds.length === 0) {
+                document.getElementById('status').textContent = 'No valid token IDs found';
+                return;
+            }
+
+            // Switch to has-tokens mode (shows clickable tokens instead of textarea)
+            const panel = document.getElementById('tokens-panel');
+            panel.classList.add('has-tokens');
+            panel.classList.remove('editing');
+
+            displayTokens();
+            document.getElementById('status').textContent = `Processing ${tokenIds.length} tokens...`;
+
+            await decodeTokens();
+        }
+
+        // Set up textarea event listener
+        function setupTokenInput() {
+            const input = document.getElementById('tokens-input');
+            let debounceTimer;
+
+            // Process on paste or after typing stops
+            input.addEventListener('input', () => {
+                clearTimeout(debounceTimer);
+                debounceTimer = setTimeout(processTokenInput, 500);
+            });
+
+            // Also process immediately on paste
+            input.addEventListener('paste', () => {
+                setTimeout(processTokenInput, 100);
+            });
+        }
+
         // Load default token file on page load
         window.loadDefaultTokens = async function loadDefaultTokens() {
             const status = document.getElementById('status');
             status.textContent = 'Loading tokenizer...';
+
+            // Set up input handling
+            setupTokenInput();
+            setupTokensPanelDoubleClick();
 
             // Wait for tiktoken to be ready (check both flag and wait for event)
             if (!window.tiktokenReady) {
@@ -908,13 +1002,22 @@
             try {
                 const response = await fetch('tokens_demo.txt');
                 if (!response.ok) {
-                    status.textContent = 'Failed to load tokens file';
+                    status.textContent = 'Paste token IDs in the left panel';
                     return;
                 }
                 const text = await response.text();
+
+                // Populate textarea with loaded tokens
+                document.getElementById('tokens-input').value = text.trim();
+
                 tokenIds = text.trim().split('\n')
                     .map(line => parseInt(line.trim()))
                     .filter(n => !isNaN(n));
+
+                // Switch to has-tokens mode (shows clickable tokens instead of textarea)
+                const panel = document.getElementById('tokens-panel');
+                panel.classList.add('has-tokens');
+                panel.classList.remove('editing');
 
                 displayTokens();
                 status.textContent = `Loaded ${tokenIds.length} tokens, decoding...`;
@@ -922,7 +1025,7 @@
                 // Auto-decode after loading
                 await decodeTokens();
             } catch (error) {
-                status.textContent = `Error: ${error.message}`;
+                status.textContent = `Paste token IDs in the left panel`;
             }
         }
 
