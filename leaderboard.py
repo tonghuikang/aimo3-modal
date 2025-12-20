@@ -45,6 +45,7 @@ def parse_leaderboard_csv(csv_content: str) -> list[dict]:
     image=image,
     secrets=[modal.Secret.from_name("kaggle")],
     schedule=modal.Cron("* * * * *"),  # Every minute
+    timeout=20 * 60,
 )
 def check_leaderboard():
     import subprocess
