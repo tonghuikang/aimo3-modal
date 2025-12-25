@@ -211,7 +211,7 @@ STATS_COLUMNS = [
     "final_answer",
     "time_taken",
     "time_available",
-    "solver_to_token_length",
+    "solver_to_length",
     "solver_to_answer",
 ]
 
@@ -224,7 +224,7 @@ def save_stats(
     final_answer: int,
     time_taken: float,
     time_available: float,
-    solver_to_token_length: dict[int, int],
+    solver_to_length: dict[int, int],
     solver_to_answer: dict[int, int],
 ) -> None:
     """Append stats for a question to the CSV file."""
@@ -233,7 +233,7 @@ def save_stats(
         "final_answer": final_answer,
         "time_taken": round(time_taken, 1),
         "time_available": round(time_available, 1),
-        "solver_to_token_length": str(solver_to_token_length),
+        "solver_to_length": str(solver_to_length),
         "solver_to_answer": str(solver_to_answer),
     }
     assert list(row_data.keys()) == STATS_COLUMNS, (
@@ -797,7 +797,7 @@ def is_valid_answer_string(text: str) -> bool:
 # %% [code] {"jupyter":{"outputs_hidden":false},"execution":{"iopub.status.busy":"2025-11-24T08:23:00.334105Z","iopub.execute_input":"2025-11-24T08:23:00.334228Z","iopub.status.idle":"2025-11-24T08:23:00.341278Z","shell.execute_reply.started":"2025-11-24T08:23:00.334218Z","shell.execute_reply":"2025-11-24T08:23:00.340907Z"}}
 
 completed_question_ids: set[str] = set()
-question_id_to_solver_to_token_length: dict[str, dict[int, int]] = {"": {}}
+question_id_to_solver_to_length: dict[str, dict[int, int]] = {"": {}}
 question_id_to_solver_to_answer: dict[str, dict[int, int]] = {"": {}}
 
 
@@ -1053,7 +1053,7 @@ def solve_single(
         if is_valid_answer_string(boxed_text):
             answer_suffix = f"{boxed_text}"
         total_tokens = len(all_token_ids)
-        question_id_to_solver_to_token_length[question_id][solver_index] = total_tokens
+        question_id_to_solver_to_length[question_id][solver_index] = total_tokens
         # Count tool calls from the token stream
         tool_call_count = detokenized_text.count("to=python code")
         base_path = f"{SOLUTIONS_DIR}/{question_id}/{solver_index:02d}-{total_tokens:05d}-{tool_call_count:02d}-{answer_suffix}"
@@ -1088,7 +1088,7 @@ def solve(question_text: str, question_id: str = "") -> int:
     await_client()
     print("client connected")
     os.makedirs(f"{SOLUTIONS_DIR}/{question_id}", exist_ok=True)
-    question_id_to_solver_to_token_length[question_id] = {}
+    question_id_to_solver_to_length[question_id] = {}
     question_id_to_solver_to_answer[question_id] = {}
     completed_question_ids.discard(question_id)  # just in case question_id collides
 
@@ -1119,7 +1119,7 @@ def solve(question_text: str, question_id: str = "") -> int:
         final_answer=final_answer,
         time_taken=time_taken,
         time_available=time_available,
-        solver_to_token_length=question_id_to_solver_to_token_length[question_id],
+        solver_to_length=question_id_to_solver_to_length[question_id],
         solver_to_answer=question_id_to_solver_to_answer[question_id],
     )
     print(f"Submitting {final_answer} for {question_id} in {time_taken:.1f}s")
