@@ -835,21 +835,18 @@ def vote_answer(question_id: str, force_answer: bool = False) -> int | None:
 
 
 # %% [code] {"jupyter":{"outputs_hidden":false},"execution":{"iopub.status.busy":"2025-11-24T08:26:53.213762Z","iopub.execute_input":"2025-11-24T08:26:53.214218Z","iopub.status.idle":"2025-11-24T08:26:53.221603Z","shell.execute_reply.started":"2025-11-24T08:26:53.214205Z","shell.execute_reply":"2025-11-24T08:26:53.221218Z"}}
-def rollout_solution(
+def rollout_given_state(
     all_token_ids: list[int],
     jupyter_session: LocalJupyterSession,
     should_stop: Callable[[], bool] = lambda: False,
-    solver_index: int = 0,
 ) -> list[int]:
     """
-    Pure rollout function that generates tokens and handles tool calls.
-    Returns the final token IDs after generation completes.
+    Rollout function that generates tokens and handles tool calls given existing state.
 
     Args:
         all_token_ids: Initial prompt token IDs
-        jupyter_session: Jupyter session for executing Python code
+        jupyter_session: Jupyter session for executing Python code (with existing state)
         should_stop: Callback to check if generation should stop early
-        solver_index: Index for logging purposes
 
     Returns:
         Final token IDs after rollout completes
@@ -937,7 +934,7 @@ def rollout_solution(
                             python_code = first_block.text
                     if python_code:
                         print(
-                            f"Solver {solver_index:01d} iteration {iteration:01d} tool {tool_call_count:02d} token {len(all_token_ids):05d}",
+                            f"iteration {iteration:01d} tool {tool_call_count:02d} token {len(all_token_ids):05d}",
                             flush=True,
                         )
                         # Execute the code using stateful Jupyter session
@@ -964,7 +961,7 @@ def rollout_solution(
         boxed_text = extract_boxed_text(text_response)
         user_follow_up = None
         print(
-            f"Solver {solver_index:01d} iteration {iteration:01d} tool {tool_call_count:02d} token {len(all_token_ids):05d}"
+            f"iteration {iteration:01d} tool {tool_call_count:02d} token {len(all_token_ids):05d}"
         )
         if not is_valid_answer_string(boxed_text):
             print("follow-up - ask boxed answer")
@@ -980,92 +977,104 @@ def rollout_solution(
     return all_token_ids
 
 
+def rollout(
+    all_token_ids: list[int],
+    should_stop: Callable[[], bool] = lambda: False,
+) -> list[int]:
+    """
+    Rollout function that creates session state and generates tokens.
+
+    Args:
+        all_token_ids: Initial prompt token IDs
+        should_stop: Callback to check if generation should stop early
+
+    Returns:
+        Final token IDs after rollout completes
+    """
+    jupyter_session = LocalJupyterSession()
+    execute_python_code(jupyter_session, "import sympy as sp")
+
+    try:
+        return rollout_given_state(
+            all_token_ids=all_token_ids,
+            jupyter_session=jupyter_session,
+            should_stop=should_stop,
+        )
+    finally:
+        jupyter_session.close()
+
+
 # %% [code] {"jupyter":{"outputs_hidden":false},"execution":{"iopub.status.busy":"2025-11-24T08:26:53.213762Z","iopub.execute_input":"2025-11-24T08:26:53.214218Z","iopub.status.idle":"2025-11-24T08:26:53.221603Z","shell.execute_reply.started":"2025-11-24T08:26:53.214205Z","shell.execute_reply":"2025-11-24T08:26:53.221218Z"}}
-def generate_solution(
+def solve_single(
     question_text: str, question_id: str = "", solver_index: int = 0
 ) -> str:
     """
-    Generate a solution for the given question.
-    Handles all side effects: file saving, counter updates, voting.
+    Single solution attempt with side effects (file saving, voting).
     """
     if question_id in completed_question_ids:
         return ""
     if time.time() >= cutoff_times[-1]:
         return ""
 
-    jupyter_session: LocalJupyterSession | None = None
+    # Build initial prompt as token IDs with Python tool enabled
+    all_token_ids: list[int] = build_prompt_token_ids(
+        system_content="You will solve the problem and return the final answer in \\boxed{}. The answer is expected to be an integer between 0 and 99999, inclusive. Do not guess the answer, unless specifically given permission to.",
+        user_content=question_text,
+    )
 
-    try:
-        # Build initial prompt as token IDs with Python tool enabled
-        all_token_ids: list[int] = build_prompt_token_ids(
-            system_content="You will solve the problem and return the final answer in \\boxed{}. The answer is expected to be an integer between 0 and 99999, inclusive. Do not guess the answer, unless specifically given permission to.",
-            user_content=question_text,
-        )
-        jupyter_session = LocalJupyterSession()
-        execute_python_code(jupyter_session, "import sympy as sp")
+    # Define stop condition callback
+    def should_stop() -> bool:
+        if question_id in completed_question_ids:
+            return True
+        if time.time() >= cutoff_times[-1]:
+            return True
+        if (
+            get_gpu_kv_cache_usage(question_id) > 70
+            and int(get_gpu_kv_cache_usage(question_id) + solver_index)
+            % num_generations
+            == 0
+        ):
+            print("terminated to prevent excessive GPU usage")
+            return True
+        return False
 
-        # Define stop condition callback
-        def should_stop() -> bool:
-            if question_id in completed_question_ids:
-                return True
-            if time.time() >= cutoff_times[-1]:
-                return True
-            if (
-                get_gpu_kv_cache_usage(question_id) > 70
-                and int(get_gpu_kv_cache_usage(question_id) + solver_index)
-                % num_generations
-                == 0
-            ):
-                print("terminated to prevent excessive GPU usage")
-                return True
-            return False
+    # Run the rollout
+    all_token_ids = rollout(
+        all_token_ids=all_token_ids,
+        should_stop=should_stop,
+    )
 
-        # Run the rollout
-        all_token_ids = rollout_solution(
-            all_token_ids=all_token_ids,
-            jupyter_session=jupyter_session,
-            should_stop=should_stop,
-            solver_index=solver_index,
-        )
+    # Process results and handle side effects
+    detokenized_text = harmony_encoding.decode(all_token_ids)
+    boxed_text = extract_boxed_text(detokenized_text)
 
-        # Process results and handle side effects
-        detokenized_text = harmony_encoding.decode(all_token_ids)
-        boxed_text = extract_boxed_text(detokenized_text)
-
-        if question_id and all_token_ids:
-            answer_suffix = "NA"
-            if is_valid_answer_string(boxed_text):
-                answer_suffix = f"{boxed_text}"
-            total_tokens = len(all_token_ids)
-            question_id_to_solver_to_token_length[question_id][solver_index] = (
-                total_tokens
-            )
-            # Count tool calls from the token stream
-            tool_call_count = detokenized_text.count("to=python code")
-            base_path = f"{SOLUTIONS_DIR}/{question_id}/{solver_index:02d}-{total_tokens:05d}-{tool_call_count:02d}-{answer_suffix}"
-            # Save full stream as token IDs (one token ID per line)
-            with open(f"{base_path}-tokens.txt", "w") as f:
-                for token_id in all_token_ids:
-                    f.write(f"{token_id}\n")
-            # Save detokenized full stream for readability
-            with open(f"{base_path}-text.txt", "w") as f:
-                f.write(detokenized_text)
-
+    if question_id and all_token_ids:
+        answer_suffix = "NA"
         if is_valid_answer_string(boxed_text):
-            question_id_to_solver_to_answer[question_id][solver_index] = int(boxed_text)
-            vote_answer(question_id)
+            answer_suffix = f"{boxed_text}"
+        total_tokens = len(all_token_ids)
+        question_id_to_solver_to_token_length[question_id][solver_index] = total_tokens
+        # Count tool calls from the token stream
+        tool_call_count = detokenized_text.count("to=python code")
+        base_path = f"{SOLUTIONS_DIR}/{question_id}/{solver_index:02d}-{total_tokens:05d}-{tool_call_count:02d}-{answer_suffix}"
+        # Save full stream as token IDs (one token ID per line)
+        with open(f"{base_path}-tokens.txt", "w") as f:
+            for token_id in all_token_ids:
+                f.write(f"{token_id}\n")
+        # Save detokenized full stream for readability
+        with open(f"{base_path}-text.txt", "w") as f:
+            f.write(detokenized_text)
 
-        return boxed_text
+    if is_valid_answer_string(boxed_text):
+        question_id_to_solver_to_answer[question_id][solver_index] = int(boxed_text)
+        vote_answer(question_id)
 
-    finally:
-        # Always clean up the Jupyter session when done
-        if jupyter_session is not None:
-            jupyter_session.close()
+    return boxed_text
 
 
 # %% [code] {"jupyter":{"outputs_hidden":false},"execution":{"iopub.status.busy":"2025-11-24T08:26:54.553208Z","iopub.execute_input":"2025-11-24T08:26:54.553692Z","iopub.status.idle":"2025-11-24T08:27:03.475341Z","shell.execute_reply.started":"2025-11-24T08:26:54.553671Z","shell.execute_reply":"2025-11-24T08:27:03.474837Z"}}
 if is_on_kaggle_interactive():
-    generate_solution("What is 1+1?")
+    solve_single("What is 1+1?")
 
 # %% [code] {"jupyter":{"outputs_hidden":false},"execution":{"iopub.status.busy":"2025-11-24T08:27:06.296266Z","iopub.execute_input":"2025-11-24T08:27:06.296867Z","iopub.status.idle":"2025-11-24T08:27:06.300859Z","shell.execute_reply.started":"2025-11-24T08:27:06.29685Z","shell.execute_reply":"2025-11-24T08:27:06.300371Z"}}
 import concurrent.futures
@@ -1093,7 +1102,7 @@ def solve(question_text: str, question_id: str = "") -> int:
     with concurrent.futures.ThreadPoolExecutor(max_workers=num_generations) as executor:
         # run in parallel
         results = executor.map(
-            generate_solution,
+            solve_single,
             [question_text] * num_generations,
             [question_id] * num_generations,
             list(range(num_generations)),
