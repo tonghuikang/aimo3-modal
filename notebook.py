@@ -467,7 +467,7 @@ class LocalJupyterSession:
             return f"[Previous execution output]\n{output.rstrip()}\n{end_marker}\n"
         return ""
 
-    def execute(self, code: str) -> str:
+    def execute(self, code: str, continue_executing_on_timeout: bool = False) -> str:
         """Execute code in the kernel, returning combined stdout/stderr output."""
         # Drain any pending output from previous timed-out execution
         pending_output = self._drain_pending_output()
@@ -485,8 +485,14 @@ class LocalJupyterSession:
             try:
                 msg = client.get_iopub_msg(timeout=effective_timeout)
             except queue.Empty:
-                # Deferred interruption: let kernel continue, interrupt on next execute()
-                self._pending_msg_id = msg_id
+                if continue_executing_on_timeout:
+                    # Deferred interruption: let kernel continue, interrupt on next execute()
+                    self._pending_msg_id = msg_id
+                    error_msg = "[TIMEOUT] Execution still running. Will drain remaining output on next call."
+                else:
+                    # Immediate interruption
+                    self._km.interrupt_kernel()
+                    error_msg = "[TIMEOUT] Execution interrupted."
                 # Return partial output with timeout message
                 partial_output = "".join(stdout_parts)
                 if stderr_parts:
@@ -495,7 +501,6 @@ class LocalJupyterSession:
                         if partial_output
                         else "".join(stderr_parts)
                     )
-                error_msg = "[TIMEOUT] Execution still running. Will drain remaining output on next call."
                 result = f"{partial_output.rstrip()}\n{error_msg}".lstrip()
                 return f"{pending_output}{result}" if pending_output else result
 
@@ -532,8 +537,14 @@ class LocalJupyterSession:
             try:
                 reply = client.get_shell_msg(timeout=effective_timeout)
             except queue.Empty:
-                # Shell channel timeout - also use deferred interruption
-                self._pending_msg_id = msg_id
+                if continue_executing_on_timeout:
+                    # Shell channel timeout - use deferred interruption
+                    self._pending_msg_id = msg_id
+                    error_msg = "[TIMEOUT] Execution still running. Will drain remaining output on next call."
+                else:
+                    # Immediate interruption
+                    self._km.interrupt_kernel()
+                    error_msg = "[TIMEOUT] Execution interrupted."
                 partial_output = "".join(stdout_parts)
                 if stderr_parts:
                     partial_output = (
@@ -541,7 +552,6 @@ class LocalJupyterSession:
                         if partial_output
                         else "".join(stderr_parts)
                     )
-                error_msg = "[TIMEOUT] Execution still running. Will drain remaining output on next call."
                 result = f"{partial_output.rstrip()}\n{error_msg}".lstrip()
                 return f"{pending_output}{result}" if pending_output else result
 
