@@ -734,7 +734,7 @@ def vote_answer(question_id: str, force_answer: bool = False) -> int | None:
 
 # %% [code] {"jupyter":{"outputs_hidden":false},"execution":{"iopub.status.busy":"2025-11-24T08:26:53.213762Z","iopub.execute_input":"2025-11-24T08:26:53.214218Z","iopub.status.idle":"2025-11-24T08:26:53.221603Z","shell.execute_reply.started":"2025-11-24T08:26:53.214205Z","shell.execute_reply":"2025-11-24T08:26:53.221218Z"}}
 def generate_solution(
-    question_text: str, question_id: str = "", solution_index: int = 0
+    question_text: str, question_id: str = "", solver_index: int = 0
 ) -> str:
     if question_id in completed_question_ids:
         return ""
@@ -809,7 +809,7 @@ def generate_solution(
                         breaking = True
                     if (
                         get_gpu_kv_cache_usage(question_id) > 70
-                        and int(get_gpu_kv_cache_usage(question_id) + solution_index)
+                        and int(get_gpu_kv_cache_usage(question_id) + solver_index)
                         % num_generations
                         == 0
                     ):
@@ -854,7 +854,7 @@ def generate_solution(
                                 python_code = first_block.text
                         if python_code:
                             print(
-                                f"solution {solution_index:01d} iteration {iteration:01d} tool {tool_call_count:02d} token {len(all_token_ids):05d}"
+                                f"Solver {solver_index:01d} iteration {iteration:01d} tool {tool_call_count:02d} token {len(all_token_ids):05d}"
                             )
                             # Lazily create the Jupyter session on first tool call
                             if jupyter_session is None:
@@ -889,7 +889,7 @@ def generate_solution(
             boxed_text = extract_boxed_text(text_response)
             user_follow_up = None
             print(
-                f"solution {solution_index:01d} iteration {iteration:01d} tool {tool_call_count:02d} token {len(all_token_ids):05d}"
+                f"Solver {solver_index:01d} iteration {iteration:01d} tool {tool_call_count:02d} token {len(all_token_ids):05d}"
             )
             if not is_valid_answer_string(extract_boxed_text(text_response)):
                 if iteration == 0 and cutoff_times[-1] - time.time() < 90:
@@ -931,7 +931,7 @@ def generate_solution(
             if is_valid_answer_string(boxed_text):
                 answer_suffix = f"{boxed_text}"
             total_tokens = len(all_token_ids)
-            base_path = f"{SOLUTIONS_DIR}/{question_id}/{solution_index:02d}-{total_tokens:05d}-{tool_call_count:02d}-{answer_suffix}"
+            base_path = f"{SOLUTIONS_DIR}/{question_id}/{solver_index:02d}-{total_tokens:05d}-{tool_call_count:02d}-{answer_suffix}"
             # Save full stream as token IDs (one token ID per line)
             with open(f"{base_path}-tokens.txt", "w") as f:
                 for token_id in all_token_ids:
