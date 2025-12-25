@@ -1,1 +1,1 @@
-uv run kaggle kernels push -p . --timeout 0
+uv run kaggle kernels push -p . --timeout 1
