@@ -17,6 +17,8 @@ run_all_questions = False  # ignored for submissions
 # %% [code] {"jupyter":{"outputs_hidden":false}}
 import os
 import time
+from collections.abc import Callable
+
 from kaggle_secrets import UserSecretsClient
 
 secrets = UserSecretsClient()
@@ -713,16 +715,166 @@ def vote_answer(question_id: str, force_answer: bool = False) -> int | None:
 
 
 # %% [code] {"jupyter":{"outputs_hidden":false},"execution":{"iopub.status.busy":"2025-11-24T08:26:53.213762Z","iopub.execute_input":"2025-11-24T08:26:53.214218Z","iopub.status.idle":"2025-11-24T08:26:53.221603Z","shell.execute_reply.started":"2025-11-24T08:26:53.214205Z","shell.execute_reply":"2025-11-24T08:26:53.221218Z"}}
+def rollout_solution(
+    all_token_ids: list[int],
+    jupyter_session: LocalJupyterSession,
+    should_stop: Callable[[], bool] = lambda: False,
+    solver_index: int = 0,
+) -> list[int]:
+    """
+    Pure rollout function that generates tokens and handles tool calls.
+    Returns the final token IDs after generation completes.
+
+    Args:
+        all_token_ids: Initial prompt token IDs
+        jupyter_session: Jupyter session for executing Python code
+        should_stop: Callback to check if generation should stop early
+        solver_index: Index for logging purposes
+
+    Returns:
+        Final token IDs after rollout completes
+    """
+    tool_call_count = 0
+
+    for iteration in range(64):
+        # Loop until we get an answer
+        while True:
+            # Loop to handle tool calls within each iteration
+            response_ids: list[int] = []
+            text_response = ""
+            breaking = False
+
+            # Use streaming with completions API
+            stream: Stream[Completion] = client.completions.create(
+                model="vllm-model",
+                prompt=all_token_ids,
+                max_tokens=max_model_len - len(all_token_ids) - 8192 * 2,
+                temperature=1.0,
+                stream=True,
+                extra_body=dict(
+                    min_p=0.02,
+                    stop_token_ids=stop_token_ids,
+                    return_token_ids=True,
+                ),
+            )
+
+            # Use StreamableParser to process streaming tokens
+            stream_parser = StreamableParser(harmony_encoding, role=Role.ASSISTANT)
+
+            for chunk in stream:
+                # Get token IDs from the chunk (vLLM extension)
+                chunk_token_ids = getattr(chunk.choices[0], "token_ids", None)
+                if chunk_token_ids:
+                    response_ids.extend(chunk_token_ids)
+                    # Process tokens through harmony parser for text
+                    for token_id in chunk_token_ids:
+                        stream_parser.process(token_id)
+
+                # Also get text directly if available
+                chunk_text = chunk.choices[0].text
+                if chunk_text:
+                    text_response += chunk_text
+
+                # Check finish_reason to see if generation completed naturally
+                finish_reason = chunk.choices[0].finish_reason
+                if finish_reason:
+                    break
+
+                if should_stop():
+                    breaking = True
+                    break
+
+                # Stop early if we found a valid boxed answer
+                if (
+                    chunk_text
+                    and "}" in chunk_text
+                    and is_valid_answer_string(extract_boxed_text(text_response))
+                ):
+                    break
+
+            # Append response token IDs to prompt for multi-turn
+            all_token_ids.extend(response_ids)
+            stream.close()
+
+            if breaking:
+                break
+
+            # Check if the last parsed message is a tool call
+            # After streaming, parser.messages contains the parsed Message objects
+            parsed_messages = stream_parser.messages
+            if parsed_messages:
+                last_message = parsed_messages[-1]
+                if (
+                    last_message.recipient is not None
+                    and last_message.recipient.startswith("python")
+                ):
+                    tool_call_count += 1
+                    # Extract Python code from the message content
+                    python_code = ""
+                    if last_message.content:
+                        first_block = last_message.content[0]
+                        if isinstance(first_block, TextContent):
+                            python_code = first_block.text
+                    if python_code:
+                        print(
+                            f"Solver {solver_index:01d} iteration {iteration:01d} tool {tool_call_count:02d} token {len(all_token_ids):05d}",
+                            flush=True,
+                        )
+                        # Execute the code using stateful Jupyter session
+                        output = execute_python_code(
+                            jupyter_session, python_code, timeout=10
+                        )
+                        if len(output) > 12_000:
+                            output = output[:5000] + "(truncated)" + output[-5000:]
+
+                        # Create python tool response message
+                        tool_response = make_python_tool_response(
+                            output, channel=last_message.channel
+                        )
+                        # Append tool response tokens
+                        all_token_ids = append_tool_response_token_ids(
+                            all_token_ids, tool_response
+                        )
+                        continue
+
+            # Exit inner loop
+            break
+
+        if breaking:
+            break
+
+        boxed_text = extract_boxed_text(text_response)
+        user_follow_up = None
+        print(
+            f"Solver {solver_index:01d} iteration {iteration:01d} tool {tool_call_count:02d} token {len(all_token_ids):05d}"
+        )
+        if not is_valid_answer_string(boxed_text):
+            print("follow-up - ask boxed answer")
+            user_follow_up = "The answer is expected to be an integer between 0 and 99999 inclusive. Place your final answer in \\boxed{}. Do not guess the answer."
+        else:
+            # answer found, no issues detected, proceed to answering
+            break
+
+        if user_follow_up:
+            # Append response and user follow-up as token IDs
+            all_token_ids = append_user_turn_token_ids(all_token_ids, user_follow_up)
+
+    return all_token_ids
+
+
+# %% [code] {"jupyter":{"outputs_hidden":false},"execution":{"iopub.status.busy":"2025-11-24T08:26:53.213762Z","iopub.execute_input":"2025-11-24T08:26:53.214218Z","iopub.status.idle":"2025-11-24T08:26:53.221603Z","shell.execute_reply.started":"2025-11-24T08:26:53.214205Z","shell.execute_reply":"2025-11-24T08:26:53.221218Z"}}
 def generate_solution(
     question_text: str, question_id: str = "", solver_index: int = 0
 ) -> str:
+    """
+    Generate a solution for the given question.
+    Handles all side effects: file saving, counter updates, voting.
+    """
     if question_id in completed_question_ids:
         return ""
     if time.time() >= cutoff_times[-1]:
         return ""
 
-    # Create a dedicated Jupyter session for this solution attempt
-    # Each generate_solution call gets its own isolated session
     jupyter_session: LocalJupyterSession | None = None
 
     try:
@@ -734,146 +886,31 @@ def generate_solution(
         jupyter_session = LocalJupyterSession(timeout=10.0)
         execute_python_code(jupyter_session, "import sympy as sp", timeout=10)
 
-        generation_idx = 0
-        tool_call_count = 0
+        # Define stop condition callback
+        def should_stop() -> bool:
+            if question_id in completed_question_ids:
+                return True
+            if time.time() >= cutoff_times[-1]:
+                return True
+            if (
+                get_gpu_kv_cache_usage(question_id) > 70
+                and int(get_gpu_kv_cache_usage(question_id) + solver_index)
+                % num_generations
+                == 0
+            ):
+                print("terminated to prevent excessive GPU usage")
+                return True
+            return False
 
-        for iteration in range(64):
-        # Loop until we get an answer
-            while True:
-                # Loop to handle tool calls within each iteration
-                response_ids: list[int] = []
-                text_response = ""
-                breaking = False
+        # Run the rollout
+        all_token_ids = rollout_solution(
+            all_token_ids=all_token_ids,
+            jupyter_session=jupyter_session,
+            should_stop=should_stop,
+            solver_index=solver_index,
+        )
 
-                # Use streaming with completions API
-                stream: Stream[Completion] = client.completions.create(
-                    model="vllm-model",
-                    prompt=all_token_ids,
-                    max_tokens=max_model_len - len(all_token_ids) - 8192 * 2,
-                    temperature=1.0,
-                    stream=True,
-                    extra_body=dict(
-                        min_p=0.02,
-                        stop_token_ids=stop_token_ids,
-                        return_token_ids=True,
-                    ),
-                )
-
-                # Use StreamableParser to process streaming tokens
-                stream_parser = StreamableParser(harmony_encoding, role=Role.ASSISTANT)
-
-                for chunk in stream:
-                    generation_idx += 1
-                    # Get token IDs from the chunk (vLLM extension)
-                    chunk_token_ids = getattr(chunk.choices[0], "token_ids", None)
-                    if chunk_token_ids:
-                        response_ids.extend(chunk_token_ids)
-                        # Process tokens through harmony parser for text
-                        for token_id in chunk_token_ids:
-                            stream_parser.process(token_id)
-
-                    # Also get text directly if available
-                    chunk_text = chunk.choices[0].text
-                    if chunk_text:
-                        text_response += chunk_text
-
-                    # Check finish_reason to see if generation completed naturally
-                    finish_reason = chunk.choices[0].finish_reason
-                    if finish_reason:
-                        break
-
-                    if question_id in completed_question_ids:
-                        # stop generating if we have finalized on an answer
-                        breaking = True
-                    if time.time() >= cutoff_times[-1]:
-                        breaking = True
-                    if (
-                        get_gpu_kv_cache_usage(question_id) > 70
-                        and int(get_gpu_kv_cache_usage(question_id) + solver_index)
-                        % num_generations
-                        == 0
-                    ):
-                        print("terminated to prevent excessive GPU usage")
-                        breaking = True
-                    if breaking:
-                        break
-                    # instead of breaking = True, so we want to inject instructions for these conditions
-                    if (
-                        chunk_text
-                        and "}" in chunk_text
-                        and is_valid_answer_string(extract_boxed_text(text_response))
-                    ):
-                        break
-
-                # Append response token IDs to prompt for multi-turn
-                all_token_ids.extend(response_ids)
-                stream.close()
-
-                if breaking:
-                    break
-
-                # Check if the last parsed message is a tool call
-                # After streaming, parser.messages contains the parsed Message objects
-                parsed_messages = stream_parser.messages
-                if parsed_messages:
-                    last_message = parsed_messages[-1]
-                    if (
-                        last_message.recipient is not None
-                        and last_message.recipient.startswith("python")
-                    ):
-                        tool_call_count += 1
-                        # Extract Python code from the message content
-                        python_code = ""
-                        if last_message.content:
-                            first_block = last_message.content[0]
-                            if isinstance(first_block, TextContent):
-                                python_code = first_block.text
-                        if python_code:
-                            print(
-                                f"Solver {solver_index:01d} iteration {iteration:01d} tool {tool_call_count:02d} token {len(all_token_ids):05d}",
-                                flush=True,
-                            )
-                            # Execute the code using stateful Jupyter session
-                            output = execute_python_code(
-                                jupyter_session, python_code, timeout=10
-                            )
-                            if len(output) > 12_000:
-                                output = output[:5000] + "(truncated)" + output[-5000:]
-
-                            # Create python tool response message
-                            tool_response = make_python_tool_response(
-                                output, channel=last_message.channel
-                            )
-                            # Append tool response tokens
-                            all_token_ids = append_tool_response_token_ids(
-                                all_token_ids, tool_response
-                            )
-                            continue
-
-                # Exit inner loop
-                break
-
-            if breaking:
-                break
-
-            boxed_text = extract_boxed_text(text_response)
-            user_follow_up = None
-            print(
-                f"Solver {solver_index:01d} iteration {iteration:01d} tool {tool_call_count:02d} token {len(all_token_ids):05d}"
-            )
-            if not is_valid_answer_string(boxed_text):
-                print("follow-up - ask boxed answer")
-                user_follow_up = "The answer is expected to be an integer between 0 and 99999 inclusive. Place your final answer in \\boxed{}. Do not guess the answer."
-            else:
-                # answer found, no issues detected, proceed to answering
-                break
-
-            if user_follow_up:
-                # Append response and user follow-up as token IDs
-                all_token_ids = append_user_turn_token_ids(
-                    all_token_ids, user_follow_up
-                )
-
+        # Process results and handle side effects
         detokenized_text = harmony_encoding.decode(all_token_ids)
         boxed_text = extract_boxed_text(detokenized_text)
 
@@ -882,6 +919,8 @@ def generate_solution(
             if is_valid_answer_string(boxed_text):
                 answer_suffix = f"{boxed_text}"
             total_tokens = len(all_token_ids)
+            # Count tool calls from the token stream
+            tool_call_count = detokenized_text.count("to=python code")
             base_path = f"{SOLUTIONS_DIR}/{question_id}/{solver_index:02d}-{total_tokens:05d}-{tool_call_count:02d}-{answer_suffix}"
             # Save full stream as token IDs (one token ID per line)
             with open(f"{base_path}-tokens.txt", "w") as f:
