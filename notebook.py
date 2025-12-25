@@ -351,12 +351,12 @@ class LocalJupyterSession:
     Thread-safe: creates its own ZMQ context for use within a single thread.
     """
 
-    def __init__(self, timeout: float = 10.0) -> None:
+    def __init__(self) -> None:
         import zmq
         from jupyter_client.blocking.client import BlockingKernelClient
         from jupyter_client.manager import KernelManager
 
-        self._default_timeout = timeout
+        self._default_timeout = 10.0
         # Create a dedicated ZMQ context for this session (thread-safe)
         self._zmq_context = zmq.Context()
         self._km = KernelManager(context=self._zmq_context)
@@ -467,13 +467,13 @@ class LocalJupyterSession:
             return f"[Previous execution output]\n{output.rstrip()}\n{end_marker}\n"
         return ""
 
-    def execute(self, code: str, timeout: float | None = None) -> str:
+    def execute(self, code: str) -> str:
         """Execute code in the kernel, returning combined stdout/stderr output."""
         # Drain any pending output from previous timed-out execution
         pending_output = self._drain_pending_output()
 
         client = self._client
-        effective_timeout = timeout or self._default_timeout
+        effective_timeout = self._default_timeout
         msg_id = client.execute(
             code, store_history=True, allow_stdin=False, stop_on_error=False
         )
@@ -589,12 +589,10 @@ class LocalJupyterSession:
             self.close()
 
 
-def execute_python_code(
-    session: LocalJupyterSession, script: str, timeout: float = 10.0
-) -> str:
+def execute_python_code(session: LocalJupyterSession, script: str) -> str:
     """Execute Python code in a stateful Jupyter session."""
     try:
-        return session.execute(script, timeout=timeout)
+        return session.execute(script)
     except TimeoutError as exc:
         return f"[ERROR] {exc}"
 
@@ -946,9 +944,7 @@ def rollout_solution(
                             flush=True,
                         )
                         # Execute the code using stateful Jupyter session
-                        output = execute_python_code(
-                            jupyter_session, python_code, timeout=10
-                        )
+                        output = execute_python_code(jupyter_session, python_code)
                         if len(output) > 12_000:
                             output = output[:5000] + "(truncated)" + output[-5000:]
 
@@ -1008,8 +1004,8 @@ def generate_solution(
             system_content="You will solve the problem and return the final answer in \\boxed{}. The answer is expected to be an integer between 0 and 99999, inclusive. Do not guess the answer, unless specifically given permission to.",
             user_content=question_text,
         )
-        jupyter_session = LocalJupyterSession(timeout=10.0)
-        execute_python_code(jupyter_session, "import sympy as sp", timeout=10)
+        jupyter_session = LocalJupyterSession()
+        execute_python_code(jupyter_session, "import sympy as sp")
 
         # Define stop condition callback
         def should_stop() -> bool:
