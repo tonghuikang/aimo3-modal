@@ -528,10 +528,7 @@ def make_python_tool_response(output: str, channel: str | None = None) -> Messag
     """Create a tool response message for the Python tool."""
     content = TextContent(text=output)
     author = Author(role=Role.TOOL, name="python")
-    message = Message(
-        author=author,
-        content=[content],
-    ).with_recipient("assistant")
+    message = Message(author=author, content=[content]).with_recipient("assistant")
     if channel:
         message = message.with_channel(channel)
     return message
@@ -540,26 +537,15 @@ def make_python_tool_response(output: str, channel: str | None = None) -> Messag
 def build_prompt_token_ids(
     system_content: str,
     user_content: str,
-    reasoning_effort: ReasoningEffort,
-    enable_python_tool: bool = False,
 ) -> list[int]:
     """Convert system and user content to token IDs using harmony format."""
-    system_content_obj = SystemContent.new().with_reasoning_effort(reasoning_effort)
-    if enable_python_tool:
-        # Enable Python tool using with_tools() for stateless mode
-        system_content_obj = system_content_obj.with_tools(python_tool_config)
-    system_message = Message.from_role_and_content(
-        Role.SYSTEM,
-        system_content_obj,
-    )
+    system_content_obj = SystemContent.new().with_reasoning_effort(ReasoningEffort.HIGH)
+    system_content_obj = system_content_obj.with_tools(python_tool_config)
+    system_message = Message.from_role_and_content(Role.SYSTEM, system_content_obj)
     developer_message = Message.from_role_and_content(
-        Role.DEVELOPER,
-        DeveloperContent.new().with_instructions(system_content),
+        Role.DEVELOPER, DeveloperContent.new().with_instructions(system_content)
     )
-    user_message = Message.from_role_and_content(
-        Role.USER,
-        user_content,
-    )
+    user_message = Message.from_role_and_content(Role.USER, user_content)
     convo = Conversation.from_messages(
         [system_message, developer_message, user_message]
     )
@@ -569,36 +555,31 @@ def build_prompt_token_ids(
 
 
 def append_user_turn_token_ids(
-    prompt_ids: list[int], response_ids: list[int], user_content: str
+    all_token_ids: list[int], user_content: str
 ) -> list[int]:
-    """Append response token IDs and a new user turn to the prompt."""
-    all_tokens = prompt_ids + response_ids
-    # Build new user message and render to tokens
+    """Append a new user turn to the token IDs."""
     new_user_message = Message.from_role_and_content(Role.USER, user_content)
     user_tokens = list(
         harmony_encoding.render_conversation_for_completion(
             Conversation.from_messages([new_user_message]), Role.ASSISTANT
         )
     )
-    # Combine: previous prompt + response + user turn tokens
-    return all_tokens + user_tokens
+    return all_token_ids + user_tokens
 
 
 import time
 
 
 def append_tool_response_token_ids(
-    prompt_ids: list[int], response_ids: list[int], tool_response: Message
+    all_token_ids: list[int], tool_response: Message
 ) -> list[int]:
-    """Append response token IDs and a tool response to the prompt."""
-    all_tokens = prompt_ids + response_ids
-    # Render tool response message to tokens
+    """Append a tool response to the token IDs."""
     tool_tokens = list(
         harmony_encoding.render_conversation_for_completion(
             Conversation.from_messages([tool_response]), Role.ASSISTANT
         )
     )
-    return all_tokens + tool_tokens
+    return all_token_ids + tool_tokens
 
 
 # %% [code] {"jupyter":{"outputs_hidden":false},"execution":{"iopub.status.busy":"2025-11-25T11:23:07.544491Z","iopub.execute_input":"2025-11-25T11:23:07.544919Z","iopub.status.idle":"2025-11-25T11:23:07.550311Z","shell.execute_reply.started":"2025-11-25T11:23:07.5449Z","shell.execute_reply":"2025-11-25T11:23:07.549876Z"}}
@@ -631,7 +612,6 @@ if is_on_kaggle_interactive():
     test_prompt_ids = build_prompt_token_ids(
         system_content="Reply your answer in \\boxed{}",
         user_content="How many r are there in strawberry?",
-        reasoning_effort=ReasoningEffort.HIGH,
     )
     resp: Completion = client.completions.create(
         model="vllm-model",
@@ -747,20 +727,20 @@ def generate_solution(
 
     try:
         # Build initial prompt as token IDs with Python tool enabled
-        prompt_ids: list[int] = build_prompt_token_ids(
+        all_token_ids: list[int] = build_prompt_token_ids(
             system_content="You will solve the problem and return the final answer in \\boxed{}. The answer is expected to be an integer between 0 and 99999, inclusive. Do not guess the answer, unless specifically given permission to.",
             user_content=question_text,
-            reasoning_effort=ReasoningEffort.HIGH,
-            enable_python_tool=True,  # Enable Python tool for code execution
         )
+        jupyter_session = LocalJupyterSession(timeout=10.0)
+        execute_python_code(jupyter_session, "import sympy as sp", timeout=10)
 
-        all_token_ids: list[int] = prompt_ids.copy()
         generation_idx = 0
         tool_call_count = 0
 
-        for iteration in range(3):  # guess at 90, guess at 30
-            # Inner loop to handle tool calls within each iteration
+        for iteration in range(3):
+        # Loop until we get an answer
             while True:
+                # Loop to handle tool calls within each iteration
                 response_ids: list[int] = []
                 text_response = ""
                 breaking = False
@@ -768,8 +748,8 @@ def generate_solution(
                 # Use streaming with completions API
                 stream: Stream[Completion] = client.completions.create(
                     model="vllm-model",
-                    prompt=prompt_ids,
-                    max_tokens=32768,
+                    prompt=all_token_ids,
+                    max_tokens=max_model_len - len(all_token_ids) - 8192,
                     temperature=1.0,
                     stream=True,
                     extra_body=dict(
@@ -854,30 +834,24 @@ def generate_solution(
                                 python_code = first_block.text
                         if python_code:
                             print(
-                                f"Solver {solver_index:01d} iteration {iteration:01d} tool {tool_call_count:02d} token {len(all_token_ids):05d}"
+                                f"Solver {solver_index:01d} iteration {iteration:01d} tool {tool_call_count:02d} token {len(all_token_ids):05d}",
+                                flush=True,
                             )
-                            # Lazily create the Jupyter session on first tool call
-                            if jupyter_session is None:
-                                jupyter_session = LocalJupyterSession(timeout=10.0)
                             # Execute the code using stateful Jupyter session
                             output = execute_python_code(
                                 jupyter_session, python_code, timeout=10
                             )
-                            # Create tool response message
+                            if len(output) > 12_000:
+                                output = output[:5000] + "(truncated)" + output[-5000:]
+
+                            # Create python tool response message
                             tool_response = make_python_tool_response(
                                 output, channel=last_message.channel
                             )
-                            # Append tool response to prompt
-                            new_prompt_ids = append_tool_response_token_ids(
-                                prompt_ids, response_ids, tool_response
+                            # Append tool response tokens
+                            all_token_ids = append_tool_response_token_ids(
+                                all_token_ids, tool_response
                             )
-                            # Track the new tokens added (tool response portion)
-                            added_tokens = new_prompt_ids[
-                                len(prompt_ids) + len(response_ids) :
-                            ]
-                            all_token_ids.extend(added_tokens)
-                            prompt_ids = new_prompt_ids
-                            # Continue the inner loop to get next generation
                             continue
 
                 # Exit inner loop
@@ -891,37 +865,18 @@ def generate_solution(
             print(
                 f"Solver {solver_index:01d} iteration {iteration:01d} tool {tool_call_count:02d} token {len(all_token_ids):05d}"
             )
-            if not is_valid_answer_string(extract_boxed_text(text_response)):
-                if iteration == 0 and cutoff_times[-1] - time.time() < 90:
-                    print("follow-up - guess answer soon")
-                    user_follow_up = "The answer is expected to be an integer between 0 and 99999 inclusive. Please make an educated guess (e.g. lower bound, upper bound, current best answer, ...) and put your your final answer in \\boxed{}."
-                elif iteration == 1 and cutoff_times[-1] - time.time() < 30:
-                    print("follow-up - guess answer now")
-                    user_follow_up = "The answer is expected to be an integer between 0 and 99999 inclusive. Please guess a reasonable answer and put in \\boxed{} as soon as possible."
-                else:
-                    print("follow-up - ask boxed answer")
-                    user_follow_up = "The answer is expected to be an integer between 0 and 99999 inclusive. Place your final answer in \\boxed{}. Do not guess the answer."
-            elif int(boxed_text) <= 10:
-                print("follow-up - are you sure")
-                user_follow_up = (
-                    "Are you sure that is the answer? Do not guess the answer."
-                )
-            elif iteration == 0 and len(all_token_ids) < 3200:
-                print("follow-up - have you verified")
-                user_follow_up = "Have you verified your answer?"
+            if not is_valid_answer_string(boxed_text):
+                print("follow-up - ask boxed answer")
+                user_follow_up = "The answer is expected to be an integer between 0 and 99999 inclusive. Place your final answer in \\boxed{}. Do not guess the answer."
             else:
                 # answer found, no issues detected, proceed to answering
                 break
 
             if user_follow_up:
                 # Append response and user follow-up as token IDs
-                new_prompt_ids = append_user_turn_token_ids(
-                    prompt_ids, response_ids, user_follow_up
+                all_token_ids = append_user_turn_token_ids(
+                    all_token_ids, user_follow_up
                 )
-                # Track the new tokens added (user follow-up portion)
-                added_tokens = new_prompt_ids[len(prompt_ids) + len(response_ids) :]
-                all_token_ids.extend(added_tokens)
-                prompt_ids = new_prompt_ids
 
         detokenized_text = harmony_encoding.decode(all_token_ids)
         boxed_text = extract_boxed_text(detokenized_text)
