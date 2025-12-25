@@ -92,9 +92,54 @@ cutoff_times.pop()
 
 from datetime import datetime
 
+# Create timestamped run directory
+os.makedirs("runs", exist_ok=True)
 RUN_DIR = f"runs/{datetime.now().strftime('%Y-%m-%d-%H-%M-%S')}"
 SOLUTIONS_DIR = f"{RUN_DIR}/solutions"
 os.makedirs(SOLUTIONS_DIR, exist_ok=True)
+
+# Initialize stats CSV file
+from collections import Counter
+
+import pandas as pd
+
+STATS_CSV_PATH = "stats.csv"  # saved in root directory
+STATS_COLUMNS = [
+    "question_id",
+    "final_answer",
+    "time_taken",
+    "time_available",
+    "solver_to_token_length",
+    "solver_to_answer",
+]
+
+if __name__ == "__main__":
+    pd.DataFrame(columns=pd.Index(STATS_COLUMNS)).to_csv(STATS_CSV_PATH, index=False)
+
+
+def save_stats(
+    question_id: str,
+    final_answer: int,
+    time_taken: float,
+    time_available: float,
+    solver_to_token_length: dict[int, int],
+    solver_to_answer: dict[int, int],
+) -> None:
+    """Append stats for a question to the CSV file."""
+    row_data = {
+        "question_id": question_id,
+        "final_answer": final_answer,
+        "time_taken": round(time_taken, 1),
+        "time_available": round(time_available, 1),
+        "solver_to_token_length": str(solver_to_token_length),
+        "solver_to_answer": str(solver_to_answer),
+    }
+    assert list(row_data.keys()) == STATS_COLUMNS, (
+        f"Column mismatch: {list(row_data.keys())} != {STATS_COLUMNS}"
+    )
+    row = pd.DataFrame([row_data])
+    row.to_csv(STATS_CSV_PATH, mode="a", header=False, index=False)
+
 
 if is_on_kaggle():
     if serve_vllm_on_kaggle:
@@ -662,19 +707,19 @@ def is_valid_answer_string(text: str) -> bool:
 
 
 # %% [code] {"jupyter":{"outputs_hidden":false},"execution":{"iopub.status.busy":"2025-11-24T08:23:00.334105Z","iopub.execute_input":"2025-11-24T08:23:00.334228Z","iopub.status.idle":"2025-11-24T08:23:00.341278Z","shell.execute_reply.started":"2025-11-24T08:23:00.334218Z","shell.execute_reply":"2025-11-24T08:23:00.340907Z"}}
-from collections import Counter
 
 completed_question_ids: set[str] = set()
-question_id_to_counter: dict[str, Counter] = {"": Counter()}
+question_id_to_solver_to_token_length: dict[str, dict[int, int]] = {"": {}}
+question_id_to_solver_to_answer: dict[str, dict[int, int]] = {"": {}}
 
 
 import math
-from collections import Counter
 
 
 def vote_answer(question_id: str, force_answer: bool = False) -> int | None:
-    # reads counter from global
-    counter = question_id_to_counter[question_id]
+    # derive counter from solver_to_answer
+    solver_to_answer = question_id_to_solver_to_answer[question_id]
+    counter = Counter(solver_to_answer.values())
     if force_answer and not counter:
         print(f"Current GPU usage {get_gpu_kv_cache_usage()}")
         print("force_answer=True but no answer recorded")
@@ -919,6 +964,9 @@ def generate_solution(
             if is_valid_answer_string(boxed_text):
                 answer_suffix = f"{boxed_text}"
             total_tokens = len(all_token_ids)
+            question_id_to_solver_to_token_length[question_id][solver_index] = (
+                total_tokens
+            )
             # Count tool calls from the token stream
             tool_call_count = detokenized_text.count("to=python code")
             base_path = f"{SOLUTIONS_DIR}/{question_id}/{solver_index:02d}-{total_tokens:05d}-{tool_call_count:02d}-{answer_suffix}"
@@ -931,7 +979,7 @@ def generate_solution(
                 f.write(detokenized_text)
 
         if is_valid_answer_string(boxed_text):
-            question_id_to_counter[question_id][int(boxed_text)] += 1
+            question_id_to_solver_to_answer[question_id][solver_index] = int(boxed_text)
             vote_answer(question_id)
 
         return boxed_text
@@ -948,15 +996,18 @@ if is_on_kaggle_interactive():
 
 # %% [code] {"jupyter":{"outputs_hidden":false},"execution":{"iopub.status.busy":"2025-11-24T08:27:06.296266Z","iopub.execute_input":"2025-11-24T08:27:06.296867Z","iopub.status.idle":"2025-11-24T08:27:06.300859Z","shell.execute_reply.started":"2025-11-24T08:27:06.29685Z","shell.execute_reply":"2025-11-24T08:27:06.300371Z"}}
 import concurrent.futures
-from collections import Counter
 
 
 def solve(question_text: str, question_id: str = "") -> int:
     print(f"processing {question_id}")
+    question_start_time = time.time()
+    time_available = cutoff_times[-1] - question_start_time if cutoff_times else 0
+    print(f"time_available {time_available:.1f}s")
     await_client()
     print("client connected")
     os.makedirs(f"{SOLUTIONS_DIR}/{question_id}", exist_ok=True)
-    question_id_to_counter[question_id] = Counter()
+    question_id_to_solver_to_token_length[question_id] = {}
+    question_id_to_solver_to_answer[question_id] = {}
     completed_question_ids.discard(question_id)  # just in case question_id collides
 
     if question_id and time.time() > cutoff_times[-1]:
@@ -978,6 +1029,19 @@ def solve(question_text: str, question_id: str = "") -> int:
 
     final_answer = vote_answer(question_id, force_answer=True)
     assert final_answer is not None
+
+    # Save stats
+    time_taken = time.time() - question_start_time
+    save_stats(
+        question_id=question_id,
+        final_answer=final_answer,
+        time_taken=time_taken,
+        time_available=time_available,
+        solver_to_token_length=question_id_to_solver_to_token_length[question_id],
+        solver_to_answer=question_id_to_solver_to_answer[question_id],
+    )
+    print(f"Submitting {final_answer} for {question_id} in {time_taken:.1f}s")
+
     return final_answer
 
 
