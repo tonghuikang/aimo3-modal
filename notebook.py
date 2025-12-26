@@ -842,9 +842,11 @@ def rollout_given_state(
         # Loop until we get an answer
         while True:
             # Loop to handle tool calls within each iteration
-            response_ids: list[int] = []
             text_response = ""
             breaking = False
+
+            if len(all_token_ids) > max_model_len - 8192 * 3:
+                return all_token_ids
 
             # Use streaming with completions API
             stream: Stream[Completion] = client.completions.create(
@@ -867,9 +869,9 @@ def rollout_given_state(
                 # Get token IDs from the chunk (vLLM extension)
                 chunk_token_ids = getattr(chunk.choices[0], "token_ids", None)
                 if chunk_token_ids:
-                    response_ids.extend(chunk_token_ids)
                     # Process tokens through harmony parser for text
                     for token_id in chunk_token_ids:
+                        all_token_ids.append(token_id)
                         stream_parser.process(token_id)
 
                 # Also get text directly if available
@@ -895,7 +897,6 @@ def rollout_given_state(
                     break
 
             # Append response token IDs to prompt for multi-turn
-            all_token_ids.extend(response_ids)
             stream.close()
 
             if breaking:
