@@ -196,6 +196,7 @@ STATS_COLUMNS = [
     "final_answer",
     "time_taken",
     "time_available",
+    "total_length",
     "solver_to_length",
     "solver_to_answer",
 ]
@@ -218,6 +219,7 @@ def save_stats(
         "final_answer": final_answer,
         "time_taken": round(time_taken, 1),
         "time_available": round(time_available, 1),
+        "total_length": sum(solver_to_length.values()),
         "solver_to_length": str(solver_to_length),
         "solver_to_answer": str(solver_to_answer),
     }
@@ -348,7 +350,7 @@ class LocalJupyterSession:
         self._km.start_kernel()
         self._client: BlockingKernelClient = self._km.blocking_client()
         self._client.start_channels()
-        self._client.wait_for_ready(timeout=self._default_timeout)
+        self._client.wait_for_ready(timeout=None)
         # Disable colors in IPython tracebacks
         self._client.execute("%colors NoColor", store_history=False)
         # Track msg_id of a timed-out execution that may still be running
@@ -710,7 +712,8 @@ import requests
 
 
 @cached(cache=TTLCache(maxsize=50, ttl=20))
-def get_gpu_kv_cache_usage(question_id: str | None = None) -> float:
+def get_gpu_kv_cache_usage(question_id: str | None) -> float:
+    # question_id is used as cache key
     # Parse vLLM /metrics endpoint using configured base URL
     try:
         base_url = os.environ["OPENAI_API_BASE"]
@@ -722,7 +725,8 @@ def get_gpu_kv_cache_usage(question_id: str | None = None) -> float:
             if line.startswith("vllm:kv_cache_usage_perc"):
                 value = float(line.split()[-1])
                 return value * 100  # convert to percentage
-    except (requests.RequestException, ValueError, IndexError):
+    except (requests.RequestException, ValueError, IndexError) as e:
+        print(f"get_gpu_kv_cache_usage: {e}")
         pass
     return -1
 
@@ -791,7 +795,7 @@ def vote_answer(question_id: str, force_answer: bool = False) -> int | None:
     solver_to_answer = question_id_to_solver_to_answer[question_id]
     answer_counter = Counter(solver_to_answer.values())
     if force_answer and not answer_counter:
-        print(f"Current GPU usage {get_gpu_kv_cache_usage()}")
+        print(f"Current GPU usage {get_gpu_kv_cache_usage(question_id):.1f}")
         print("force_answer=True but no answer recorded")
         completed_question_ids.add(question_id)
         return 12453
@@ -803,7 +807,7 @@ def vote_answer(question_id: str, force_answer: bool = False) -> int | None:
 
     if force_answer:
         print(f"Votes over {sum(answer_counter.values())} attempts")
-        print(f"Current GPU usage {get_gpu_kv_cache_usage()}")
+        print(f"Current GPU usage {get_gpu_kv_cache_usage(question_id):.1f}")
         for value, count in sorted_answers:
             print(f"{value:10}   {count:8d}")
         return sorted_answers[0][0]
@@ -963,6 +967,15 @@ def rollout_given_state(
     return all_token_ids
 
 
+starter_code = """
+import random
+import numpy as np
+import sympy as sp
+random.seed(42)
+np.random.seed(42)
+"""
+
+
 def rollout(
     all_token_ids: list[int],
     should_stop: Callable[[], bool] = lambda: False,
@@ -977,17 +990,22 @@ def rollout(
     Returns:
         Final token IDs after rollout completes
     """
-    jupyter_session = LocalJupyterSession()
-    execute_python_code(jupyter_session, "import sympy as sp")
-
+    jupyter_session = None
     try:
+        jupyter_session = LocalJupyterSession()
+        execute_python_code(jupyter_session, starter_code)
         return rollout_given_state(
             all_token_ids=all_token_ids,
             jupyter_session=jupyter_session,
             should_stop=should_stop,
         )
+    except RuntimeError as e:
+        print(f"rollout: {e}")
+        return all_token_ids
     finally:
-        jupyter_session.close()
+        if jupyter_session is not None:
+            print("Cleaning up Jupyter session")
+            jupyter_session.close()
 
 
 # %% [code] {"jupyter":{"outputs_hidden":false},"execution":{"iopub.status.busy":"2025-11-24T08:26:53.213762Z","iopub.execute_input":"2025-11-24T08:26:53.214218Z","iopub.status.idle":"2025-11-24T08:26:53.221603Z","shell.execute_reply.started":"2025-11-24T08:26:53.214205Z","shell.execute_reply":"2025-11-24T08:26:53.221218Z"}}
@@ -997,6 +1015,8 @@ def solve_single(
     """
     Single solution attempt with side effects (file saving, voting).
     """
+    await_client()
+    print("Client connected")
     if question_id in completed_question_ids:
         return ""
     if time.time() >= cutoff_times[-1]:
@@ -1014,13 +1034,11 @@ def solve_single(
             return True
         if time.time() >= cutoff_times[-1]:
             return True
-        if (
-            get_gpu_kv_cache_usage(question_id) > 70
-            and int(get_gpu_kv_cache_usage(question_id) + solver_index)
-            % num_generations
-            == 0
-        ):
-            print("terminated to prevent excessive GPU usage")
+        solver_index_to_gpu_threshold = [95, 90, 85, 80, 75, 70]
+        solver_index_mod = solver_index % len(solver_index_to_gpu_threshold)
+        gpu_kv_cache_usage = get_gpu_kv_cache_usage(question_id)
+        if gpu_kv_cache_usage > solver_index_to_gpu_threshold[solver_index_mod]:
+            print(f"Terminated Solver {solver_index} at {gpu_kv_cache_usage:.1f}")
             return True
         return False
 
@@ -1063,16 +1081,14 @@ if is_on_kaggle_interactive():
     solve_single("What is 1+1?")
 
 # %% [code] {"jupyter":{"outputs_hidden":false},"execution":{"iopub.status.busy":"2025-11-24T08:27:06.296266Z","iopub.execute_input":"2025-11-24T08:27:06.296867Z","iopub.status.idle":"2025-11-24T08:27:06.300859Z","shell.execute_reply.started":"2025-11-24T08:27:06.29685Z","shell.execute_reply":"2025-11-24T08:27:06.300371Z"}}
-import concurrent.futures
+import threading
 
 
 def solve(question_text: str, question_id: str = "") -> int:
-    print(f"processing {question_id}")
+    print(f"Processing {question_id}")
     question_start_time = time.time()
     time_available = cutoff_times[-1] - question_start_time if cutoff_times else 0
     print(f"time_available {time_available:.1f}s")
-    await_client()
-    print("client connected")
     os.makedirs(f"{SOLUTIONS_DIR}/{question_id}", exist_ok=True)
     question_id_to_solver_to_length[question_id] = {}
     question_id_to_solver_to_answer[question_id] = {}
@@ -1085,15 +1101,22 @@ def solve(question_text: str, question_id: str = "") -> int:
     get_gpu_kv_cache_usage(
         question_id
     )  # run once to prevent running in the first batch of execution
-    with concurrent.futures.ThreadPoolExecutor(max_workers=num_generations) as executor:
-        # run in parallel
-        results = executor.map(
-            solve_single,
-            [question_text] * num_generations,
-            [question_id] * num_generations,
-            list(range(num_generations)),
-        )
-        list(results)
+
+    # Start solver threads
+    # I suspect that init LocalJupyterSession(timeout=10.0) can stall
+    for solver_index in range(num_generations):
+        threading.Thread(
+            target=solve_single,
+            args=(question_text, question_id, solver_index),
+        ).start()
+
+    # Poll every second until completed or time runs out
+    for _ in range(int(time_available) + 1):
+        if question_id in completed_question_ids:
+            break
+        time.sleep(1)
+    else:
+        print("Solve timeout - continuing to submission")
 
     final_answer = vote_answer(question_id, force_answer=True)
     assert final_answer is not None
