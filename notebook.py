@@ -1209,10 +1209,8 @@ if is_on_kaggle():
         "/kaggle/input/ai-mathematical-olympiad-progress-prize-3/reference.csv"
     ).drop("answer", axis=1)
 
-    replication_count = min(replication_count_for_commit_runs, 50 // len(df))
-
     dfs = []
-    for replication_idx in range(replication_count):
+    for replication_idx in range(replication_count_for_commit_runs):
         df_copy = df.copy()
         df_copy["id"] = df_copy["id"] + f"_{replication_idx}"
         dfs.append(df_copy)
@@ -1243,6 +1241,13 @@ def predict(id_: pl.Series, problem: pl.Series) -> pl.DataFrame | pd.DataFrame:
                 print("on kaggle commit, skipping question")
                 # not popping cutoff_times
                 return pl.DataFrame({"id": id_, "answer": 12315})
+            if len(cutoff_times) <= 1:
+                # when replication_count_for_commit_runs is set to large
+                # the set of question to matched needs to be narrower
+                # otherwise we run out of cutoff_times
+                # just in case we forget
+                # should only affect commit runs
+                return pl.DataFrame({"id": id_, "answer": 12316})
 
     # Make a prediction
     prediction = solve(question_text, question_id=question_id)
